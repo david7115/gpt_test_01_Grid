@@ -1,13 +1,23 @@
 import json, pandas as pd, streamlit as st
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from datetime import datetime
+import pathlib
+
+# DB 존재 확인
+db_path = pathlib.Path("data/kepco.db")
+if not db_path.exists():
+    st.error("DB 파일(data/kepco.db)이 없습니다. 먼저 etl.py를 실행해 데이터를 저장하세요.")
+    st.stop()
 
 engine = create_engine("sqlite:///data/kepco.db", future=True)
 
-def fmt_date(yymmdd:str):
-    if not yymmdd: return ""
-    try: return datetime.strptime(yymmdd, "%Y%m%d").strftime("%Y-%m-%d")
-    except: return yymmdd
+def fmt_date(yymmdd: str):
+    if not yymmdd: 
+        return ""
+    try:
+        return datetime.strptime(yymmdd, "%Y%m%d").strftime("%Y-%m-%d")
+    except Exception:
+        return yymmdd
 
 FIELD_LABELS = {
     "PROGRESSSTATE": "진행상태코드",
@@ -36,31 +46,54 @@ FIELD_LABELS = {
     "YMD06": "계통연계예정일",
     "YMD07": "비고일자",
 }
-
 DATE_KEYS = {"YMD01","YMD02","YMD03","YMD04","YMD05","YMD06","YMD07"}
 
 st.title("배전망 접속 대상 (오프라인 조회)")
 rcpt = st.text_input("접수번호 입력", value="5201-20230120-010178")
 
 if rcpt:
-    row = engine.execute(
-        "SELECT payload_json, updated_at FROM receipt WHERE rcpt_no = ?", (rcpt,)
-    ).fetchone()
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT payload_json, updated_at FROM receipt WHERE rcpt_no = :rcpt"),
+                {"rcpt": rcpt}
+            ).fetchone()
+    except Exception as e:
+        st.exception(e)
+        st.stop()
+
     if not row:
         st.warning("DB에 데이터가 없습니다. 먼저 etl.py를 실행해 저장하세요.")
     else:
-        data = json.loads(row[0])
+        try:
+            data = json.loads(row[0]) if isinstance(row[0], (str, bytes)) else row[0]
+        except Exception:
+            st.error("payload_json 파싱에 실패했습니다. ETL 저장 형식을 확인하세요.")
+            st.stop()
+
         st.caption(f"업데이트: {row[1]}")
+        d = dict(data.get("dma_initData", {}))
 
-        d = data.get("dma_initData", {})
-        # 날짜 포맷 교정
+        # 날짜 포맷
         for k in DATE_KEYS:
-            d[k] = fmt_date(d.get(k, ""))
+            if k in d:
+                d[k] = fmt_date(d.get(k, ""))
 
-        # 라벨 매핑
-        pretty = { FIELD_LABELS.get(k,k): v for k,v in d.items() }
+        # 보기 좋은 순서(원하시는 순서로 정렬 가능)
+        show_order = [
+            "APPLNM","APPLCD","PROGRESSSTATE","GENSOURCENM","EQUIPCAPA",
+            "YMD01","YMD02","YMD03","YMD04","YMD05","YMD06","YMD07",
+            "JURISOFFICENM","JURISOFFICETEL","UPPOOFFICENM","SUBSTNM",
+            "DLNM","DLCD","JURISOFFICECD","UPPOOFFICECD","ACPTSEQNO",
+            "MTRNO","PBLCREINFORCE","CNSTRCTNVSOR"
+        ]
+        pretty = {FIELD_LABELS.get(k, k): d.get(k, "") for k in show_order if k in d}
+        # 나머지 키도 포함하고 싶다면:
+        for k, v in d.items():
+            if k not in show_order:
+                pretty[FIELD_LABELS.get(k, k)] = v
 
-        st.dataframe(pd.DataFrame(pretty.items(), columns=["항목","값"]), use_container_width=True)
+        st.dataframe(pd.DataFrame(pretty.items(), columns=["항목", "값"]), use_container_width=True)
         st.download_button(
             "CSV 다운로드",
             pd.DataFrame([pretty]).to_csv(index=False).encode("utf-8-sig"),
